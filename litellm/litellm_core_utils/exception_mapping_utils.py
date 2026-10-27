@@ -2036,7 +2036,9 @@ def _map_azure_exception(
             litellm_debug_info=extra_information,
             response=getattr(original_exception, "response", None),
         )
-    elif "This model's maximum context length is" in error_str:
+    elif azure_error_code == "context_length_exceeded" or ExceptionCheckers.is_error_str_context_window_exceeded(
+        error_str
+    ):
         raise ContextWindowExceededError(
             message=f"AzureException ContextWindowExceededError - {message}",
             llm_provider="azure",

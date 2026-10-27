@@ -1,4 +1,6 @@
 import json
+from collections.abc import Awaitable, Callable
+from typing import Final
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -7,7 +9,7 @@ import respx
 
 
 import litellm
-from litellm.exceptions import ContentPolicyViolationError
+from litellm.exceptions import BadRequestError, ContentPolicyViolationError, ContextWindowExceededError
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 
 
@@ -490,3 +492,100 @@ class TestAzureExceptionMapping:
         error = exc_info.value
         assert "encrypted_content_affinity" in error.message
         assert "enable_pre_call_checks" in error.message
+
+
+_AZURE_API_BASE: Final = "https://azure-context.openai.azure.com"
+_AZURE_CALL_KWARGS: Final = {
+    "api_base": _AZURE_API_BASE,
+    "api_version": "2024-10-21",
+    "api_key": "test-azure-key",
+    "max_retries": 0,
+}
+
+
+def _azure_400(code: str) -> httpx.Response:
+    body: Final = {
+        "error": {
+            "message": "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            "type": "invalid_request_error",
+            "param": "input",
+            "code": code,
+        }
+    }
+    # Azure OpenAI pretty-prints error bodies (seen on a live deployment's chat and responses routes, 2026-10-27)
+    return httpx.Response(400, text=json.dumps(body, indent=2), headers={"content-type": "application/json"})
+
+
+async def _azure_chat(*, stream: bool) -> None:
+    messages: Final = [{"role": "user", "content": "hi"}]
+    if stream:
+        stream_response: Final = await litellm.acompletion(
+            model="azure/gpt-4o", messages=messages, stream=True, **_AZURE_CALL_KWARGS
+        )
+        assert isinstance(stream_response, litellm.CustomStreamWrapper)
+        async for _chunk in stream_response:
+            pass
+    else:
+        litellm.completion(model="azure/gpt-4o", messages=messages, **_AZURE_CALL_KWARGS)
+
+
+async def _azure_responses(*, is_async: bool) -> None:
+    if is_async:
+        await litellm.aresponses(model="azure/gpt-4o", input="hi", **_AZURE_CALL_KWARGS)
+    else:
+        litellm.responses(model="azure/gpt-4o", input="hi", **_AZURE_CALL_KWARGS)
+
+
+async def _azure_embedding() -> None:
+    litellm.embedding(model="azure/text-embedding-3-small", input="hi", **_AZURE_CALL_KWARGS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda: _azure_chat(stream=False), id="chat"),
+        pytest.param(lambda: _azure_chat(stream=True), id="async-chat-stream"),
+        pytest.param(lambda: _azure_responses(is_async=False), id="responses"),
+        pytest.param(lambda: _azure_responses(is_async=True), id="async-responses"),
+        pytest.param(_azure_embedding, id="embedding"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [("context_length_exceeded", ContextWindowExceededError), ("invalid_value", BadRequestError)],
+)
+@respx.mock
+async def test_azure_400_is_classified_by_error_code(
+    monkeypatch: pytest.MonkeyPatch, call: Callable[[], Awaitable[None]], code: str, expected: type[Exception]
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    respx.post(url__startswith=_AZURE_API_BASE).mock(return_value=_azure_400(code))
+
+    with pytest.raises(BadRequestError) as exc_info:
+        await call()
+
+    assert type(exc_info.value) is expected
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_azure_context_length_code_triggers_context_window_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    route: Final = respx.post(url__startswith=_AZURE_API_BASE).mock(return_value=_azure_400("context_length_exceeded"))
+    router: Final = litellm.Router(
+        model_list=[
+            {"model_name": "small", "litellm_params": {"model": "azure/gpt-4o", **_AZURE_CALL_KWARGS}},
+            {"model_name": "large", "litellm_params": {"model": "gpt-4.1", "mock_response": "served by large"}},
+        ],
+        context_window_fallbacks=[{"small": ["large"]}],
+        num_retries=0,
+    )
+
+    response: Final = await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # untyped **kwargs
+        model="small", messages=[{"role": "user", "content": "hi"}]
+    )
+
+    assert isinstance(response, litellm.ModelResponse)
+    assert response.choices[0].message.content == "served by large"
+    assert len(route.calls) == 1
