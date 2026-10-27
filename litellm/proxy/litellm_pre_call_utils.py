@@ -206,7 +206,11 @@ def _caller_body_session_id(data: Mapping[str, object], metadata_variable_name: 
 def _caller_session_beside_trace_header(
     normalized_headers: Mapping[str, str], data: Mapping[str, object], metadata_variable_name: str
 ) -> str | None:
-    session_headers: Final = {key: value for key, value in normalized_headers.items() if key != "x-litellm-trace-id"}
+    session_headers: Final = {
+        key: value
+        for key, value in normalized_headers.items()
+        if key not in ("x-litellm-trace-id", "x-parent-session-id")
+    }
     return get_chain_id_from_headers(session_headers) or _caller_body_session_id(data, metadata_variable_name)
 
 
@@ -1845,6 +1849,9 @@ class LiteLLMProxyRequestSetup:
         agent_id_from_header: Final = headers.get("x-litellm-agent-id")
         # Explicit litellm headers take precedence; fall back to any x-*-session-id header.
         chain_id: Final = get_chain_id_from_headers(dict(headers))
+        has_parent_session: Final = bool(
+            _SESSION_ID_VALUE_RE.fullmatch(normalized_headers.get("x-parent-session-id", ""))
+        )
 
         if agent_id_from_header:
             metadata_from_headers["agent_id"] = agent_id_from_header
@@ -1852,16 +1859,18 @@ class LiteLLMProxyRequestSetup:
 
         caller_session_beside_trace: Final = (
             _caller_session_beside_trace_header(normalized_headers, request_body, _metadata_variable_name)
-            if chain_id is not None and chain_id == normalized_headers.get("x-litellm-trace-id")
+            if has_parent_session or (chain_id is not None and chain_id == normalized_headers.get("x-litellm-trace-id"))
             else None
         )
+        header_session_id: Final = caller_session_beside_trace if has_parent_session else chain_id
         if chain_id:
             metadata_from_headers["trace_id"] = chain_id
-            metadata_from_headers["session_id"] = chain_id
-            data["litellm_session_id"] = chain_id
             data["litellm_trace_id"] = chain_id
             verbose_proxy_logger.debug("Extracted chain_id from header (trace-id/session-id): %s", chain_id)
-        else:
+        if header_session_id:
+            metadata_from_headers["session_id"] = header_session_id
+            data["litellm_session_id"] = header_session_id
+        elif not chain_id or has_parent_session:
             body_metadata: Final = data.get("metadata")
             session_id: Final = _get_anthropic_session_id_from_metadata(body_metadata)
             if session_id:

@@ -4034,6 +4034,84 @@ def test_get_chain_id_from_headers_bare_session_id_loses_to_more_specific_header
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,metadata_key",
+    [("/v1/chat/completions", "metadata"), ("/v1/messages", "litellm_metadata"), ("/v1/responses", "litellm_metadata")],
+)
+@pytest.mark.parametrize(
+    "headers,body,session",
+    [
+        ({"X-Session-Id": "child-session-1"}, {}, "child-session-1"),
+        ({"x-claude-code-session-id": "child-session-1"}, {}, "child-session-1"),
+        (
+            {"x-litellm-session-id": "child-session-1", "x-session-id": "other-session"},
+            {"litellm_session_id": "body-session"},
+            "child-session-1",
+        ),
+        ({}, {"litellm_session_id": "child-session-1", "metadata": {"session_id": "other-session"}}, "child-session-1"),
+        ({}, {"metadata": {"session_id": "child-session-1"}}, "child-session-1"),
+        ({}, {"metadata": {"user_id": {"session_id": "child-session-1"}}}, "child-session-1"),
+        ({"baggage": "session.id=child-session-1"}, {}, "child-session-1"),
+        ({"x-litellm-trace-id": "explicit-trace-1", "x-session-id": "child-session-1"}, {}, "child-session-1"),
+        ({"x-litellm-trace-id": "explicit-trace-1"}, {"metadata": {"session_id": "child-session-1"}}, "child-session-1"),
+        ({"x-litellm-trace-id": "explicit-trace-1"}, {}, None),
+        ({"x-session-id": "short"}, {}, None),
+        ({}, {}, None),
+    ],
+)
+async def test_parent_trace_group_preserves_the_child_routing_session(
+    path: str, metadata_key: str, headers: dict[str, str], body: dict[str, object], session: str | None
+) -> None:
+    request_headers: Final = {"X-Parent-Session-Id": "parent-session-1", **headers}
+    updated: Final = await add_litellm_data_to_request(
+        data={"model": "test-model", **copy.deepcopy(body)},
+        request=_make_request_mock(path, request_headers),
+        user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key"),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+    metadata: Final = updated[metadata_key]
+    trace: Final = headers.get("x-litellm-trace-id") or headers.get("x-litellm-session-id") or "parent-session-1"
+    assert updated.get("litellm_session_id") == session
+    assert metadata.get("session_id") == session
+    assert updated["litellm_trace_id"] == trace
+    assert metadata["trace_id"] == trace
+    assert metadata.get(CALLER_SESSION_ID_METADATA_KEY) in (None, session)
+
+
+@pytest.mark.parametrize("metadata_key", ["metadata", "litellm_metadata"])
+def test_parent_trace_group_keeps_active_metadata_session_precedence(metadata_key: str) -> None:
+    data: Final[dict[str, object]] = {
+        "metadata": {"session_id": "chat-session-1"},
+        "litellm_metadata": {"session_id": "native-session-1"},
+    }
+    session: Final = "chat-session-1" if metadata_key == "metadata" else "native-session-1"
+    LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+        headers={"x-parent-session-id": "parent-session-1"}, data=data, _metadata_variable_name=metadata_key
+    )
+    assert data[metadata_key] == {
+        "session_id": session, "trace_id": "parent-session-1", CALLER_SESSION_ID_METADATA_KEY: session
+    }
+    assert data["litellm_session_id"] == session
+    assert data["litellm_trace_id"] == "parent-session-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages", "/v1/responses"])
+async def test_parent_trace_group_does_not_satisfy_required_session_policy(path: str) -> None:
+    with pytest.raises(ProxyException, match="Request has no session id"):
+        await add_litellm_data_to_request(
+            data={"model": "test-model"},
+            request=_make_request_mock(path, {"x-parent-session-id": "parent-session-1"}),
+            user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key"),
+            proxy_config=MagicMock(),
+            general_settings={"missing_session_id": "reject"},
+            version="test-version",
+        )
+
+
 def test_trace_id_from_traceparent_valid():
     from litellm.proxy.litellm_pre_call_utils import _trace_id_from_traceparent
 
